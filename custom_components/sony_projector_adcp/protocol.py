@@ -2,147 +2,130 @@
 import asyncio
 import hashlib
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 _LOGGER = logging.getLogger(__name__)
 
 NEWLINE = "\r\n"
 ENCODING = "ascii"
 TIMEOUT = 10
+CLOSE_TIMEOUT = 2
 
 
 class SonyProjectorADCP:
-    """Handle ADCP protocol communication with Sony projector."""
+    """Handle ADCP protocol communication with Sony projector.
+
+    Sony's ADCP server closes idle TCP sockets after roughly 30 seconds,
+    so we open a fresh connection for each command rather than holding
+    one open. The lock serializes concurrent callers.
+    """
 
     def __init__(self, host: str, port: int, password: str = "", use_auth: bool = True):
-        """Initialize the ADCP connection."""
         self.host = host
         self.port = port
         self.password = password
         self.use_auth = use_auth
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
         self._lock = asyncio.Lock()
 
-    async def connect(self) -> bool:
-        """Connect to the projector and authenticate if needed."""
+    async def _open(self) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Open a TCP connection and complete the ADCP auth handshake."""
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self.host, self.port),
+            timeout=TIMEOUT,
+        )
         try:
-            self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port),
-                timeout=TIMEOUT
+            data = await asyncio.wait_for(
+                reader.readuntil(NEWLINE.encode(ENCODING)),
+                timeout=TIMEOUT,
             )
-            
-            # Read authentication challenge
-            auth_response = await self._read_line()
-            
+            auth_response = data.decode(ENCODING).strip()
+
             if auth_response.startswith("PJLINK") or not self.use_auth:
-                # If we get PJLINK or auth is disabled, we might need different handling
-                # For now, just continue
                 if auth_response == "NOKEY":
                     _LOGGER.debug("Authentication disabled on projector")
-                    return True
-            
-            # Authentication enabled - handle random number
-            if self.use_auth and auth_response:
-                # Response format: random_number\r\n
-                random_num = auth_response.strip()
-                
-                if random_num and random_num != "NOKEY":
-                    # Create hash: SHA256(random_number + password)
-                    hash_input = f"{random_num}{self.password}"
-                    hash_result = hashlib.sha256(hash_input.encode()).hexdigest()
-                    
-                    # Send hash
-                    await self._write_line(hash_result)
-                    
-                    # Read authentication result
-                    auth_result = await self._read_line()
-                    
-                    if auth_result != "OK":
-                        _LOGGER.error("Authentication failed: %s", auth_result)
-                        await self.disconnect()
-                        return False
-            
-            _LOGGER.info("Connected to Sony projector at %s:%s", self.host, self.port)
-            return True
-            
+                    return reader, writer
+
+            if self.use_auth and auth_response and auth_response != "NOKEY":
+                hash_input = f"{auth_response}{self.password}"
+                hash_result = hashlib.sha256(hash_input.encode()).hexdigest()
+
+                writer.write(f"{hash_result}{NEWLINE}".encode(ENCODING))
+                await writer.drain()
+
+                ack = await asyncio.wait_for(
+                    reader.readuntil(NEWLINE.encode(ENCODING)),
+                    timeout=TIMEOUT,
+                )
+                auth_result = ack.decode(ENCODING).strip()
+                if auth_result != "OK":
+                    raise ConnectionError(f"ADCP authentication failed: {auth_result}")
+
+            return reader, writer
+        except Exception:
+            await self._close(writer)
+            raise
+
+    async def _close(self, writer: Optional[asyncio.StreamWriter]) -> None:
+        """Close a writer with a bounded wait — a half-open socket must not wedge us."""
+        if writer is None:
+            return
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=CLOSE_TIMEOUT)
+        except (asyncio.TimeoutError, Exception) as e:
+            _LOGGER.debug("Error/timeout closing connection: %s", e)
+
+    async def connect(self) -> bool:
+        """Verify we can reach the projector. Used at config-entry setup."""
+        writer = None
+        try:
+            _, writer = await self._open()
         except asyncio.TimeoutError:
             _LOGGER.error("Timeout connecting to projector")
             return False
         except Exception as e:
             _LOGGER.error("Error connecting to projector: %s", e)
             return False
+        finally:
+            await self._close(writer)
+        _LOGGER.info("Connected to Sony projector at %s:%s", self.host, self.port)
+        return True
 
     async def disconnect(self):
-        """Disconnect from the projector."""
-        if self._writer:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception as e:
-                _LOGGER.debug("Error closing connection: %s", e)
-            finally:
-                self._writer = None
-                self._reader = None
-
-    async def _read_line(self) -> str:
-        """Read a line from the projector."""
-        if not self._reader:
-            raise ConnectionError("Not connected")
-        
-        try:
-            data = await asyncio.wait_for(
-                self._reader.readuntil(NEWLINE.encode(ENCODING)),
-                timeout=TIMEOUT
-            )
-            return data.decode(ENCODING).strip()
-        except asyncio.TimeoutError:
-            _LOGGER.error("Timeout reading from projector")
-            raise
-        except Exception as e:
-            _LOGGER.error("Error reading from projector: %s", e)
-            raise
-
-    async def _write_line(self, data: str):
-        """Write a line to the projector."""
-        if not self._writer:
-            raise ConnectionError("Not connected")
-        
-        try:
-            self._writer.write(f"{data}{NEWLINE}".encode(ENCODING))
-            await self._writer.drain()
-        except Exception as e:
-            _LOGGER.error("Error writing to projector: %s", e)
-            raise
+        """No-op: connections are per-command and closed immediately."""
+        return
 
     async def send_command(self, command: str) -> Optional[str]:
-        """Send a command and return the response."""
+        """Open a connection, send a command, read the response, then close."""
         async with self._lock:
-            # Ensure we're connected
-            if not self._writer or not self._reader:
-                if not await self.connect():
-                    return None
-            
+            writer = None
             try:
-                # Send command
-                await self._write_line(command)
+                reader, writer = await self._open()
+
+                writer.write(f"{command}{NEWLINE}".encode(ENCODING))
+                await writer.drain()
                 _LOGGER.debug("Sent command: %s", command)
-                
-                # Read response
-                response = await self._read_line()
+
+                data = await asyncio.wait_for(
+                    reader.readuntil(NEWLINE.encode(ENCODING)),
+                    timeout=TIMEOUT,
+                )
+                response = data.decode(ENCODING).strip()
                 _LOGGER.debug("Received response: %s", response)
-                
-                # Check for errors
+
                 if response.startswith("err_"):
                     _LOGGER.error("Command error: %s for command: %s", response, command)
                     return None
-                
+
                 return response
-                
+            except asyncio.TimeoutError:
+                _LOGGER.error("Timeout sending command: %s", command)
+                return None
             except Exception as e:
                 _LOGGER.error("Error sending command %s: %s", command, e)
-                await self.disconnect()
                 return None
+            finally:
+                await self._close(writer)
 
     async def get_power_status(self) -> Optional[str]:
         """Get the current power status."""
